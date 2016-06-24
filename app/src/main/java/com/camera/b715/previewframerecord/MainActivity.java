@@ -9,44 +9,72 @@ import android.media.MediaCodec;
 import android.media.MediaCodecInfo;
 import android.media.MediaFormat;
 import android.media.MediaRecorder;
+import android.os.Handler;
+import android.os.Message;
 import android.os.SystemClock;
 import android.support.v7.app.AppCompatActivity;
 import android.os.Bundle;
 import android.util.Log;
 import android.view.TextureView;
+import android.view.View;
+import android.widget.Button;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.concurrent.ArrayBlockingQueue;
 
-public class MainActivity extends AppCompatActivity implements TextureView.SurfaceTextureListener{
+public class MainActivity extends AppCompatActivity implements TextureView.SurfaceTextureListener,
+        Camera.PreviewCallback {
 
-    private static int yuvqueuesize = 10;
-    public static ArrayBlockingQueue<byte[]> YUVQueue = new ArrayBlockingQueue<byte[]>(yuvqueuesize);
-    public static ArrayBlockingQueue<byte[]> YUVQueue1 = new ArrayBlockingQueue<byte[]>(yuvqueuesize);
-
+    protected final Object mSync = new Object();
 
     private byte[] mImageCallbackBuffer = new byte[1280
             * 720 * 3 / 2];
 
     private Camera mCamera;
-    private MediaCodec mMediaCodec;
     private TextureView mPreview;
-    private VideoEncoderFromBuffer mVideoEncoder;
     private static final String TAG = "liuchang";
-    private CameraPreviewCallback mCameraPreviewCallback;
     private Camera.Parameters mCameraParamters;
+    private Button mButton;
+    private VideoEncoderFromBuffer mFirstThread;
+    private VideoEncoderFromBuffer mSecondThread;
+
+    public static final String FIRST = "first";
+    public static final String SECOND = "second";
+    private boolean isRecording = false;
+
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
         mPreview = (TextureView) findViewById(R.id.camera_preview);
+        mButton = (Button) findViewById(R.id.record);
+        mButton.setOnClickListener(new View.OnClickListener() {
+
+            @Override
+            public void onClick(View v) {
+                if (isRecording) {
+                    isRecording = false;
+                    VideoEncoderFromBuffer.pause = true;
+                    mButton.setText("isStop");
+                } else {
+                    mButton.setText("isdoing");
+                    if (VideoEncoderFromBuffer.pause) {
+
+                    } else {
+                        mFirstThread.start();
+                    }
+                    isRecording = true;
+                }
+                
+            }
+        });
         mPreview.setSurfaceTextureListener(this);
         mCamera = Camera.open(Camera.CameraInfo.CAMERA_FACING_BACK);
 
         mCameraParamters = this.mCamera.getParameters();
-        Camera.Size size  = mCameraParamters.getPreviewSize();
+        Camera.Size size = mCameraParamters.getPreviewSize();
         Log.d(TAG, "width = " + size.width + "; heigh = " + size.height);
         mCameraParamters.setPreviewFormat(ImageFormat.NV21);
         mCameraParamters.setFlashMode("off");
@@ -54,54 +82,77 @@ public class MainActivity extends AppCompatActivity implements TextureView.Surfa
         this.mCameraParamters.setSceneMode(Camera.Parameters.SCENE_MODE_AUTO);
         this.mCameraParamters.setPreviewSize(1280, 720);
         //this.mCamera.setDisplayOrientation(90);
-        mCameraPreviewCallback = new CameraPreviewCallback();
         //mCamera.addCallbackBuffer(mImageCallbackBuffer);
         //mCamera.setPreviewCallbackWithBuffer(mCameraPreviewCallback);
-        mCamera.setPreviewCallback(mCameraPreviewCallback);
+        mCamera.setPreviewCallback(this);
         mCamera.setParameters(this.mCameraParamters);
 
-        new Thread(new EncodecThread(this)).start();
-        Log.d(TAG,"liuchang oncreat tid = " + Thread.currentThread().getId());
+        mFirstThread = new VideoEncoderFromBuffer("A_debug", 1280,
+                720, mSync, mHandler, FIRST);
+        mSecondThread = new VideoEncoderFromBuffer("B_debug", 1280,
+                720, mSync, mHandler, SECOND);
 
-
+        Log.d(TAG, "liuchang oncreat tid = " + Thread.currentThread().getName());
     }
 
     @Override
     protected void onStop() {
+        VideoEncoderFromBuffer.exit= true;
         super.onStop();
 
     }
 
-    class CameraPreviewCallback implements Camera.PreviewCallback {
-        private static final String TAG = "CameraPreviewCallback";
-        private VideoEncoderFromBuffer videoEncoder = null;
-        private VideoEncoderFromBuffer videoEncoder1 = null;
-
-        private CameraPreviewCallback() {
-            videoEncoder = new VideoEncoderFromBuffer("A_debug",1280,
-                    720);
-            videoEncoder1 = new VideoEncoderFromBuffer("B_debug2",1280,
-                    720);
-        }
-
-        void close() {
-            videoEncoder.close();
-            videoEncoder1.close();
-        }
-
+    static final int NEXT_THREAD_BEGIN_WORK = 1;
+    static final int CURRENT_THREAD_STOP_WORK = 2;
+    private Handler mHandler = new Handler() {
         @Override
-        public void onPreviewFrame(byte[] data, Camera camera) {
-            Log.i(TAG, "onPreviewFrame");
-            Log.d(TAG,"liuchang onPreviewFrame tid = " + Thread.currentThread().getId());
-            long startTime = System.currentTimeMillis();
-            //System.arraycopy(data,0,datacopy,0,data.length);
-            YUVQueue.add(data);
-            YUVQueue1.add(data);
-            videoEncoder.encodeFrame(data/*, encodeData*/);
-            videoEncoder1.encodeFrame(data/*, encodeData*/);
-            long endTime = System.currentTimeMillis();
-            Log.i(TAG, Integer.toString((int)(endTime-startTime)) + "ms");
-            //camera.addCallbackBuffer(data);
+        public void handleMessage(Message msg) {
+            switch (msg.what) {
+                case NEXT_THREAD_BEGIN_WORK:
+                    Log.d(TAG,"NEXT_THREAD_BEGIN_WORK msg is " + msg.obj);
+                    if (FIRST.equals(msg.obj)) {
+                        if (mSecondThread.isAlive()) {
+                            synchronized (mSync) {
+                                mSync.notify();
+                            }
+                        } else {
+                            Log.d(TAG,"liuchang second started");
+                            mSecondThread.start();
+                        }
+                    } else if (SECOND.equals(msg.obj)) {
+                        synchronized (mSync) {
+                            mSync.notify();
+                        }
+                    }
+                    break;
+                case CURRENT_THREAD_STOP_WORK:
+                    /*if (FIRST.equals(msg.arg1)) {
+                        recordingFirst = false;
+                    } else if (SECOND.equals(msg.arg1)) {
+                        recordingSecond = false;
+                    }*/
+                    break;
+                default:
+                    Log.d(TAG, "do nothing");
+                    break;
+            }
+        }
+    };
+
+    @Override
+    public void onPreviewFrame(byte[] data, Camera camera) {
+
+        if (mFirstThread.getState() == Thread.State.RUNNABLE) {
+            Log.d(TAG, "liuchang add YUVQueue");
+            mFirstThread.addByteData(data);
+        } else {
+            mFirstThread.clearData();
+        }
+        if (mSecondThread.getState() == Thread.State.RUNNABLE) {
+            mSecondThread.addByteData(data);
+            Log.d(TAG, "liuchang add YUVQueue1");
+        } else {
+            mSecondThread.clearData();
         }
     }
 
@@ -123,7 +174,6 @@ public class MainActivity extends AppCompatActivity implements TextureView.Surfa
     @Override
     public boolean onSurfaceTextureDestroyed(SurfaceTexture surface) {
         mCamera.setPreviewCallback(null);
-        mCameraPreviewCallback.close();
         mCamera.stopPreview();
         mCamera.release();
         mCamera = null;
@@ -133,19 +183,5 @@ public class MainActivity extends AppCompatActivity implements TextureView.Surfa
     @Override
     public void onSurfaceTextureUpdated(SurfaceTexture surface) {
 
-    }
-
-    private class EncodecThread implements Runnable {
-
-        int m_width,m_height;
-        public EncodecThread(Activity activity){
-            m_width = mPreview.getWidth();
-            m_height = mPreview.getHeight();
-        }
-
-        @Override
-        public void run() {
-
-        }
     }
 }
